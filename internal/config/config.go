@@ -672,6 +672,33 @@ type TrashConfig struct {
 	// account soft deletion existed. Override with
 	// E2A_TRASH_ACCOUNT_RETENTION_DAYS.
 	AccountRetentionDays *int `yaml:"account_retention_days"`
+	// RecentSenderEraseDeferDays defers an on-demand permanent erase of
+	// anything that emailed an external recipient within this many days:
+	// the account (DELETE /v1/account?permanent=true, or the restore
+	// interstitial's "erase now"), an agent (DELETE
+	// /v1/agents/{email}?permanent=true) or a message (permanent delete of a
+	// trashed message). Each goes to (or stays in) its normal trash and is
+	// purged at the end of that trash window, so late provider feedback
+	// (complaints, bounces) still lands on the account's sending controls and
+	// aggregates, and the evidence the account check reads cannot be removed
+	// inside the window. Default 14; 0 disables it everywhere. The account
+	// deferral has no effect when account trash is disabled
+	// (account_retention_days: 0).
+	// Override with E2A_TRASH_RECENT_SENDER_ERASE_DEFER_DAYS.
+	//
+	// Unset (nil) means 14, lowered to the shortest trash window when a
+	// deployment's trash is shorter, so existing configs keep starting. An
+	// explicit value longer than retention_days or account_retention_days is
+	// rejected: the janitor purges at deleted_at + retention, which would
+	// purge deferred evidence before the window ends.
+	RecentSenderEraseDeferDays *int `yaml:"recent_sender_erase_defer_days"`
+	// EraseDeferExemptDomains are recipient domains that never count as
+	// external for RecentSenderEraseDeferDays — provider test mailboxes the
+	// prober and e2e harnesses send to. The deployment's shared_domain is
+	// always exempt in addition. Default [simulator.amazonses.com]; an
+	// explicit empty list exempts only the shared domain. Override with
+	// E2A_TRASH_ERASE_DEFER_EXEMPT_DOMAINS (comma-separated).
+	EraseDeferExemptDomains []string `yaml:"erase_defer_exempt_domains"`
 	// IdentityTombstones enables identity tombstones: every account purge
 	// holds the account's login subject(s) and email (and, for an
 	// abuse-paused account, its verified domains) as keyed digests so the
@@ -680,6 +707,42 @@ type TrashConfig struct {
 	// E2A_TOMBSTONE_KEY secret; without it signup fails closed (503) and
 	// purges are skipped. Override with E2A_TRASH_IDENTITY_TOMBSTONES.
 	IdentityTombstones bool `yaml:"identity_tombstones"`
+}
+
+// DefaultRecentSenderEraseDeferDays is the deferral window when
+// recent_sender_erase_defer_days is unset.
+const DefaultRecentSenderEraseDeferDays = 14
+
+// RecentSenderEraseDefer returns the effective deferral window in days
+// (0 = disabled): the explicit value, or the default lowered to the
+// shortest trash window.
+func (t TrashConfig) RecentSenderEraseDefer() int {
+	if t.RecentSenderEraseDeferDays != nil {
+		return *t.RecentSenderEraseDeferDays
+	}
+	d := DefaultRecentSenderEraseDeferDays
+	if t.RetentionDays < d {
+		d = t.RetentionDays
+	}
+	if ar := t.AccountRetention(); ar > 0 && ar < d {
+		d = ar
+	}
+	return d
+}
+
+// EraseDeferExemptDomainList is the full exempt-domain list the server uses
+// for the recent-sender purge deferral: the configured test domains plus the
+// deployment's shared agent domain by name (its domains row may be owned by
+// the probe account, so the unowned-row rule alone would miss it). Entries are
+// trimmed and lower-cased; empty ones are dropped.
+func (c *Config) EraseDeferExemptDomainList() []string {
+	out := make([]string, 0, len(c.Trash.EraseDeferExemptDomains)+1)
+	for _, d := range append(append([]string(nil), c.Trash.EraseDeferExemptDomains...), c.SharedDomain) {
+		if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // AccountRetention returns the effective account trash window in days
@@ -758,7 +821,10 @@ func Load(path string) (*Config, error) {
 		},
 		RateLimits: RateLimitsConfig{PollPerMinute: 240},
 		Metrics:    MetricsConfig{ListenAddr: "127.0.0.1:9091"},
-		Trash:      TrashConfig{RetentionDays: 30},
+		Trash: TrashConfig{
+			RetentionDays:           30,
+			EraseDeferExemptDomains: []string{"simulator.amazonses.com"},
+		},
 		// An absent sender_identity block keeps the fixture expiry default;
 		// an explicit `fixture_ttl: 0` survives unmarshal and disables it.
 		// The reclaim defaults are the SAFE ones: disarmed, no zones (which
@@ -993,6 +1059,21 @@ func Load(path string) (*Config, error) {
 		}
 		cfg.Trash.AccountRetentionDays = &d
 	}
+	if v := os.Getenv("E2A_TRASH_RECENT_SENDER_ERASE_DEFER_DAYS"); v != "" {
+		d, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return nil, fmt.Errorf("config: E2A_TRASH_RECENT_SENDER_ERASE_DEFER_DAYS must be a whole number of days, got %q", v)
+		}
+		cfg.Trash.RecentSenderEraseDeferDays = &d
+	}
+	if v, ok := os.LookupEnv("E2A_TRASH_ERASE_DEFER_EXEMPT_DOMAINS"); ok {
+		cfg.Trash.EraseDeferExemptDomains = nil
+		for _, d := range strings.Split(v, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				cfg.Trash.EraseDeferExemptDomains = append(cfg.Trash.EraseDeferExemptDomains, d)
+			}
+		}
+	}
 	if v := os.Getenv("E2A_TRASH_IDENTITY_TOMBSTONES"); v != "" {
 		b, err := strconv.ParseBool(strings.TrimSpace(v))
 		if err != nil {
@@ -1063,6 +1144,25 @@ func (c *Config) Validate() error {
 	}
 	if c.Trash.AccountRetentionDays != nil && *c.Trash.AccountRetentionDays < 0 {
 		return fmt.Errorf("config: trash.account_retention_days must be 0 (erase immediately) or a positive number of days (got %d)", *c.Trash.AccountRetentionDays)
+	}
+	if d := c.Trash.RecentSenderEraseDeferDays; d != nil {
+		if *d < 0 {
+			return fmt.Errorf("config: trash.recent_sender_erase_defer_days must be 0 (never defer) or a positive number of days (got %d)", *d)
+		}
+		// The janitor purges trashed items at deleted_at + retention, so a
+		// defer window longer than a trash window would let deferred
+		// evidence be purged before the window ends.
+		if *d > c.Trash.RetentionDays {
+			return fmt.Errorf("config: trash.recent_sender_erase_defer_days (%d) must not exceed trash.retention_days (%d): deferred agents and messages are purged when their trash window ends", *d, c.Trash.RetentionDays)
+		}
+		if ar := c.Trash.AccountRetention(); ar > 0 && *d > ar {
+			return fmt.Errorf("config: trash.recent_sender_erase_defer_days (%d) must not exceed trash.account_retention_days (%d): deferred accounts are purged when the account trash window ends", *d, ar)
+		}
+	}
+	for _, dom := range c.Trash.EraseDeferExemptDomains {
+		if dom = strings.TrimSpace(dom); dom == "" || strings.Contains(dom, "@") {
+			return fmt.Errorf("config: trash.erase_defer_exempt_domains entries must be bare domain names (got %q)", dom)
+		}
 	}
 	if c.Trash.RetentionDays < 1 {
 		return fmt.Errorf("config: trash.retention_days must be at least 1 (got %d) — the stable API promises soft-deleted resources stay restorable", c.Trash.RetentionDays)

@@ -101,6 +101,17 @@ type ContractServer struct {
 	// which is one contract run; no other scenario may use them.
 	DisposableTrashAPIKey string
 	DisposableEraseAPIKey string
+	// DisposableDeferredEraseAPIKey authenticates a third throwaway account
+	// seeded with a provider-accepted send to an external recipient an hour
+	// ago, so its permanent erase is deferred to the trash
+	// (identity.RecentSenderEraseDefer). Deleted exactly once per server;
+	// no other scenario may use it.
+	DisposableDeferredEraseAPIKey string
+	// DeferredPurgeAPIKey authenticates an account whose one agent has a
+	// provider-accepted send to an external recipient an hour ago, so a
+	// permanent delete of that agent or that message is deferred to the
+	// trash. Its scenario restores both, so it is re-runnable.
+	DeferredPurgeAPIKey string
 	// ReadOnlyAPIKey authenticates an account paused for abuse
 	// (pause_class abuse), which makes it read-only: every write is refused
 	// with 403 account_read_only. The read-only scenario ends by moving it to
@@ -433,28 +444,50 @@ func StartContractServer(ctx context.Context, dbURL string) (*ContractServer, er
 		}
 	}
 
+	deferredEraseKey, err := seedRecentExternalSenderAccount(ctx, pool, store)
+	if err != nil {
+		_ = smtpServer.Close()
+		_ = httpServer.Shutdown(context.Background())
+		_ = httpLn.Close()
+		wsHub.Close()
+		pool.Close()
+		return nil, err
+	}
+
+	deferredPurgeKey, err := seedDeferredPurgeAccount(ctx, pool, store)
+	if err != nil {
+		_ = smtpServer.Close()
+		_ = httpServer.Shutdown(context.Background())
+		_ = httpLn.Close()
+		wsHub.Close()
+		pool.Close()
+		return nil, err
+	}
+
 	return &ContractServer{
-		DisposableTrashAPIKey: disposable[0],
-		DisposableEraseAPIKey: disposable[1],
-		ReadOnlyAPIKey:        readOnlyKey,
-		ReadOnlyUserID:        readOnlyUser,
-		RestrictedAPIKey:      restrictedKey,
-		RestrictedUserID:      restrictedUser,
-		RestrictedSDKAPIKey:   restrictedSDKKey,
-		BaseURL:               "http://" + httpLn.Addr().String(),
-		APIKey:                key.PlaintextKey,
-		UserID:                user.ID,
-		CappedAPIKey:          cappedKey.PlaintextKey,
-		CappedUserID:          cappedUser.ID,
-		OverCapAPIKey:         overCapKey.PlaintextKey,
-		OverCapUserID:         overCapUser.ID,
-		DBPool:                pool,
-		Store:                 store,
-		WSHub:                 wsHub,
-		SMTPAddr:              smtpAddr,
-		httpServer:            httpServer,
-		httpLn:                httpLn,
-		smtpServer:            smtpServer,
+		DeferredPurgeAPIKey:           deferredPurgeKey,
+		DisposableDeferredEraseAPIKey: deferredEraseKey,
+		DisposableTrashAPIKey:         disposable[0],
+		DisposableEraseAPIKey:         disposable[1],
+		ReadOnlyAPIKey:                readOnlyKey,
+		ReadOnlyUserID:                readOnlyUser,
+		RestrictedAPIKey:              restrictedKey,
+		RestrictedUserID:              restrictedUser,
+		RestrictedSDKAPIKey:           restrictedSDKKey,
+		BaseURL:                       "http://" + httpLn.Addr().String(),
+		APIKey:                        key.PlaintextKey,
+		UserID:                        user.ID,
+		CappedAPIKey:                  cappedKey.PlaintextKey,
+		CappedUserID:                  cappedUser.ID,
+		OverCapAPIKey:                 overCapKey.PlaintextKey,
+		OverCapUserID:                 overCapUser.ID,
+		DBPool:                        pool,
+		Store:                         store,
+		WSHub:                         wsHub,
+		SMTPAddr:                      smtpAddr,
+		httpServer:                    httpServer,
+		httpLn:                        httpLn,
+		smtpServer:                    smtpServer,
 	}, nil
 }
 
@@ -545,6 +578,75 @@ const (
 	ContractReadOnlyOwner = "readonly-owner@example.test"
 	ContractReadOnlyAgent = "readonly-bot@agents.localhost"
 )
+
+// ContractDeferredEraseAgent is the sending agent of the recent-external-
+// sender fixture account.
+const ContractDeferredEraseAgent = "deferred-erase-bot@agents.localhost"
+
+// seedRecentExternalSenderAccount seeds the disposable account whose
+// permanent erase is deferred: one shared-domain agent with an outbound
+// message the provider accepted an hour ago, addressed to an external
+// recipient — the message_recipients row the send worker writes on provider
+// acceptance. Seeded directly because the contract server has no provider.
+func seedRecentExternalSenderAccount(ctx context.Context, pool *pgxpool.Pool, store *identity.Store) (string, error) {
+	user, err := store.CreateOrGetUser(ctx, "disposable-deferred-erase@example.test", "Contract Disposable", "google-contract-disposable-deferred-erase")
+	if err != nil {
+		return "", err
+	}
+	if _, err := store.CreateAgentWithLimit(ctx, ContractDeferredEraseAgent, "agents.localhost", "Deferred Erase Bot", user.ID, 0); err != nil {
+		return "", err
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO messages (id, agent_id, direction, sender, recipient, subject, delivery_status, created_at, provider_accepted_at)
+		VALUES ('msg_contract_deferred_erase', $1, 'outbound', $1, 'someone@example.com', 'contract fixture', 'sent',
+		        now() - interval '1 hour', now() - interval '1 hour')`, ContractDeferredEraseAgent); err != nil {
+		return "", err
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_recipients (id, message_id, address, kind, status)
+		VALUES ('rcpt_contract_deferred_erase', 'msg_contract_deferred_erase', 'someone@example.com', 'to', 'sent')`); err != nil {
+		return "", err
+	}
+	key, err := store.CreateAPIKey(ctx, user.ID, "contract-disposable-deferred-erase-key", nil)
+	if err != nil {
+		return "", err
+	}
+	return key.PlaintextKey, nil
+}
+
+// Deferred-purge fixture: the agent and its externally sent message.
+const (
+	ContractDeferredPurgeAgent   = "deferred-purge-bot@agents.localhost"
+	ContractDeferredPurgeMessage = "msg_contract_deferred_purge"
+)
+
+// seedDeferredPurgeAccount seeds the account whose agent and message
+// permanent deletes are deferred (see ContractServer.DeferredPurgeAPIKey).
+func seedDeferredPurgeAccount(ctx context.Context, pool *pgxpool.Pool, store *identity.Store) (string, error) {
+	user, err := store.CreateOrGetUser(ctx, "deferred-purge@example.test", "Contract Deferred Purge", "google-contract-deferred-purge")
+	if err != nil {
+		return "", err
+	}
+	if _, err := store.CreateAgentWithLimit(ctx, ContractDeferredPurgeAgent, "agents.localhost", "Deferred Purge Bot", user.ID, 0); err != nil {
+		return "", err
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO messages (id, agent_id, direction, sender, recipient, subject, delivery_status, created_at, provider_accepted_at)
+		VALUES ($1, $2, 'outbound', $2, 'someone@example.com', 'contract fixture', 'sent',
+		        now() - interval '1 hour', now() - interval '1 hour')`, ContractDeferredPurgeMessage, ContractDeferredPurgeAgent); err != nil {
+		return "", err
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_recipients (id, message_id, address, kind, status)
+		VALUES ('rcpt_contract_deferred_purge', $1, 'someone@example.com', 'to', 'sent')`, ContractDeferredPurgeMessage); err != nil {
+		return "", err
+	}
+	key, err := store.CreateAPIKey(ctx, user.ID, "contract-deferred-purge-key", nil)
+	if err != nil {
+		return "", err
+	}
+	return key.PlaintextKey, nil
+}
 
 func seedReadOnlyAccount(ctx context.Context, pool *pgxpool.Pool, store *identity.Store) (string, string, error) {
 	user, err := store.CreateOrGetUser(ctx, ContractReadOnlyOwner, "Contract Read-Only", "google-contract-readonly")

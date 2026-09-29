@@ -474,9 +474,32 @@ rate_limits:
 # -inspect-tombstone-keys shows the active version, the known versions and
 # how many live tombstones depend on each.
 # E2A_TRASH_IDENTITY_TOMBSTONES=true overrides the flag.
+#
+# recent_sender_erase_defer_days (default 14; 0 disables everywhere): an
+# on-demand permanent delete of an account (DELETE /v1/account?permanent=true,
+# or "erase now" on the restore screen), an agent (DELETE
+# /v1/agents/{email}?permanent=true) or a trashed message (?permanent=true)
+# that emailed an external recipient — anyone other than the account's own
+# agents, its verified owner mailbox, or an address on the shared agent
+# domain — within this many days is deferred: it goes to (or stays in) its
+# normal trash (receipt erase_deferred: true, purge_after) and is purged when
+# that trash window ends, so complaints and bounces that arrive days after a
+# send still land on the account's sending controls. The account deferral has
+# no effect when account trash is disabled. Unset means 14, lowered to the
+# shortest trash window; an explicit value larger than retention_days or
+# account_retention_days is refused at startup (the janitor purges at
+# deleted_at + retention). System and internal account classes are never
+# deferred. E2A_TRASH_RECENT_SENDER_ERASE_DEFER_DAYS overrides it.
+#
+# erase_defer_exempt_domains (default [simulator.amazonses.com]): recipient
+# domains that never count as external — provider test mailboxes the prober
+# and e2e harnesses send to. shared_domain is always exempt too.
+# E2A_TRASH_ERASE_DEFER_EXEMPT_DOMAINS (comma-separated) overrides it.
 trash:
   retention_days: 30
   # account_retention_days: 30
+  # recent_sender_erase_defer_days: 14
+  # erase_defer_exempt_domains: [simulator.amazonses.com]
   identity_tombstones: false
 
 # — Metrics (Prometheus) ——————————————————————————————————————————————————————
