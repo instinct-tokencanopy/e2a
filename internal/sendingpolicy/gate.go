@@ -89,20 +89,21 @@ func (m *Module) effectivePolicy(ctx context.Context, tx pgx.Tx) (RuntimePolicy,
 
 // reservationRow is one row of sending_budget_reservations.
 type reservationRow struct {
-	OperationID      string
-	Attempt          int
-	SourceAccountRef *string
-	PolicySubjectRef string
-	Purpose          Purpose
-	Day              time.Time
-	Units            int
-	Probation        bool
-	State            string
-	CallState        string
-	Nonce            *string
-	NoticeVersion    *int
-	NoticeCommitment []byte
-	Exists           bool
+	OperationID       string
+	Attempt           int
+	SourceAccountRef  *string
+	PolicySubjectRef  string
+	Purpose           Purpose
+	Day               time.Time
+	Units             int
+	AccountTrustUnits *int
+	Probation         bool
+	State             string
+	CallState         string
+	Nonce             *string
+	NoticeVersion     *int
+	NoticeCommitment  []byte
+	Exists            bool
 }
 
 // scopeKeys returns the counters this stored reservation charged, using only
@@ -127,13 +128,13 @@ func lockReservation(ctx context.Context, tx pgx.Tx, operationID string, attempt
 	err := tx.QueryRow(ctx, `
 		SELECT operation_id, submission_attempt, source_account_ref, policy_subject_ref,
 		       purpose, day, units, probation, state, call_state, authorization_nonce,
-		       notice_recipient_version, notice_recipient_commitment
+		       notice_recipient_version, notice_recipient_commitment, account_trust_units
 		  FROM sending_budget_reservations
 		 WHERE operation_id = $1 AND submission_attempt = $2
 		   FOR UPDATE`, operationID, attempt,
 	).Scan(&r.OperationID, &r.Attempt, &r.SourceAccountRef, &r.PolicySubjectRef,
 		&r.Purpose, &r.Day, &r.Units, &r.Probation, &r.State, &r.CallState, &r.Nonce,
-		&r.NoticeVersion, &r.NoticeCommitment)
+		&r.NoticeVersion, &r.NoticeCommitment, &r.AccountTrustUnits)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return reservationRow{}, nil
 	}
@@ -298,6 +299,16 @@ func (m *Module) Reserve(ctx context.Context, ref OperationRef) (Decision, Attem
 	units, err := plannedUnits(ctx, tx, op, ref.recipients)
 	if err != nil {
 		return Decision{}, AttemptRef{}, err
+	}
+	if policy.AccountTrustEnabled && op.Purpose == PurposeCustomerMessage {
+		envelope, e := messageEnvelopeQ(ctx, tx, op.OperationID)
+		if e != nil {
+			return Decision{}, AttemptRef{}, e
+		}
+		units, err = externalRecipientCount(ctx, tx, op.accountRef(), envelope)
+		if err != nil {
+			return Decision{}, AttemptRef{}, err
+		}
 	}
 
 	day, err := ledgerDay(ctx, tx)
@@ -707,6 +718,9 @@ func (m *Module) readAuthState(ctx context.Context, tx pgx.Tx, ref AttemptRef) (
 		if errors.Is(err, ErrSourceUnavailable) {
 			return st, terminalHold(ReasonSourceUnavailable), nil
 		}
+		if d, ok := rampHoldFor(err, st.day); ok {
+			return st, d, nil
+		}
 		return st, Decision{}, err
 	}
 
@@ -798,6 +812,12 @@ func (m *Module) readAuthState(ctx context.Context, tx pgx.Tx, ref AttemptRef) (
 	}
 	st.envelope = envelope
 	st.units = len(st.envelope)
+	if policy.AccountTrustEnabled && op.Purpose == PurposeCustomerMessage {
+		st.units, err = externalRecipientCount(ctx, tx, op.accountRef(), st.envelope)
+		if err != nil {
+			return st, Decision{}, err
+		}
+	}
 
 	// External sending access, decided under the locks just taken: the users
 	// row (FOR SHARE), the account control row and the plan row are all held
@@ -825,6 +845,9 @@ func (m *Module) readAuthState(ctx context.Context, tx pgx.Tx, ref AttemptRef) (
 		// vanished source is not something a retry can restore.
 		if errors.Is(err, ErrSourceUnavailable) {
 			return st, terminalHold(ReasonSourceUnavailable), nil
+		}
+		if d, ok := rampHoldFor(err, st.day); ok {
+			return st, d, nil
 		}
 		return st, Decision{}, err
 	}
@@ -1208,6 +1231,16 @@ func (m *Module) releaseReacquiredUnits(ctx context.Context, tx pgx.Tx, st authS
 	return nil
 }
 
+// accountTrustUnits records the meaning of attempt units at authorization.
+// Null marks legacy/all-recipient accounting, which cannot earn trust credit.
+func accountTrustUnits(st authState) *int {
+	if st.policy.AccountTrustEnabled && st.op.Purpose == PurposeCustomerMessage {
+		n := st.units
+		return &n
+	}
+	return nil
+}
+
 // authorize confirms the capacity, mints the single-use nonce, records the
 // provenance correlation, and returns the token.
 func (m *Module) authorize(ctx context.Context, tx pgx.Tx, st authState) (*ProviderAuthorization, error) {
@@ -1243,8 +1276,8 @@ func (m *Module) authorize(ctx context.Context, tx pgx.Tx, st authState) (*Provi
 		INSERT INTO sending_budget_reservations
 		    (operation_id, submission_attempt, source_account_ref, policy_subject_ref,
 		     purpose, day, units, probation, state, call_state, authorization_nonce,
-		     notice_recipient_version, notice_recipient_commitment)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmed', 'authorized', $9, $10, $11)
+		     notice_recipient_version, notice_recipient_commitment, account_trust_units)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmed', 'authorized', $9, $10, $11, $12)
 		ON CONFLICT (operation_id, submission_attempt) DO UPDATE
 		   SET day = EXCLUDED.day,
 		       units = EXCLUDED.units,
@@ -1254,11 +1287,12 @@ func (m *Module) authorize(ctx context.Context, tx pgx.Tx, st authState) (*Provi
 		       authorization_nonce = EXCLUDED.authorization_nonce,
 		       notice_recipient_version = EXCLUDED.notice_recipient_version,
 		       notice_recipient_commitment = EXCLUDED.notice_recipient_commitment,
+ account_trust_units = EXCLUDED.account_trust_units,
 		       provider_call_started_at = NULL,
 		       updated_at = now()`,
 		st.op.OperationID, attempt, st.op.SourceAccountRef, st.op.PolicySubjectRef,
 		st.op.Purpose, st.day, st.units, st.probation, nonce,
-		noticeVersion, noticeCommitment,
+		noticeVersion, noticeCommitment, accountTrustUnits(st),
 	); err != nil {
 		return nil, fmt.Errorf("sendingpolicy: confirm reservation: %w", err)
 	}
@@ -1631,6 +1665,19 @@ func (m *Module) RedeemProviderCall(ctx context.Context, auth ProviderAuthorizat
 	}
 	if !stored.Exists || stored.CallState != "authorized" || stored.Nonce == nil || *stored.Nonce != auth.nonce {
 		return m.invalidate(ctx, tx, auth.attempt)
+	}
+
+	if op.Purpose == PurposeCustomerMessage && policy.AccountTrustEnabled != (stored.AccountTrustUnits != nil) {
+		return m.invalidate(ctx, tx, auth.attempt)
+	}
+	if policy.AccountTrustEnabled && op.Purpose == PurposeCustomerMessage {
+		valid, err := m.recheckAccountTrustGrant(ctx, tx, op, stored)
+		if err != nil {
+			return err
+		}
+		if !valid {
+			return m.invalidate(ctx, tx, auth.attempt)
+		}
 	}
 
 	if auth.notice != nil {
@@ -2006,7 +2053,11 @@ func (m *Module) settle(ctx context.Context, operationID string, attempt int, se
 	// Ramp keys come last in the normative order, after the correlation row,
 	// which is keyed by this operation and already held under its lock.
 	if op.Purpose == PurposeCustomerMessage {
-		if err := m.rampSettle(ctx, tx, op.OperationID, settlement.Outcome); err != nil {
+		acceptedUnits := 0
+		if stored.AccountTrustUnits != nil {
+			acceptedUnits = *stored.AccountTrustUnits
+		}
+		if err := m.rampSettle(ctx, tx, op.OperationID, settlement.Outcome, stored.Day, acceptedUnits); err != nil {
 			return err
 		}
 	}
